@@ -15,7 +15,7 @@ colorama_init(autoreset=True)
 
 from libs.installer import Installer, InstallAbort
 
-SEVPY_VERSION = "v1.5.0-stable"
+SEVPY_VERSION = "v1.0.0"
 
 # Installation Root
 INSTALL_ROOT = Path.home() / ".local" / "opt"
