@@ -107,7 +107,7 @@ class Installer:
                 f"Partial log: {log_path}"
             )
 
-    def configure(self):
+    def configure(self, ensure_pip=True):
         self.pre_install_step()
 
         # ---- Install paths ----
@@ -124,8 +124,9 @@ class Installer:
             f"--libdir={libdir}",
             f"--includedir={incdir}",
             f"--mandir={mandir}",
-            "--with-ensurepip=install",
         ]
+        if ensure_pip:
+            cmd.append("--with-ensurepip=install")
 
         print("[*] Configuring build...")
         t1 = time.time()
