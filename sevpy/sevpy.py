@@ -15,7 +15,7 @@ colorama_init(autoreset=True)
 
 from libs.installer import Installer, InstallAbort
 
-SEVPY_VERSION = "v1.5.0-stable"
+SEVPY_VERSION = "v1.5.0-alpha"
 
 # Installation Root
 INSTALL_ROOT = Path.home() / ".local" / "opt"
@@ -26,12 +26,23 @@ INSTALLER_STAGE = Path.home() / ".cache" / "python-installer" / "stage"
 # GPG helpers (unchanged logic)
 # ----------------------------
 
-def extract_key_id(gpg_output):
-    match = re.search(r"using RSA key ([A-F0-9]{40})", gpg_output)
-    if not match:
-        raise RuntimeError("Could not extract GPG key ID")
-    return match.group(1)
+def extract_key_id(gpg_output: str) -> str:
+    """
+    Extract GPG key ID from gpg --verify output.
+    Supports RSA / EDDSA and short or long key IDs.
+    """
+    patterns = [
+        r"using (?:RSA|EDDSA) key ([A-F0-9]{8,40})",
+        r"key ([A-F0-9]{8,40})"
+    ]
 
+    for pat in patterns:
+        match = re.search(pat, gpg_output)
+        if match:
+            return match.group(1)
+
+    print(Fore.RED + "[X] Error: Could not extract GPG key ID from output")
+    return ""
 
 def download_file(url, out_path):
     r = req.get(url, stream=True, timeout=(10, 60))
@@ -54,10 +65,10 @@ def download_file(url, out_path):
             f.write(chunk)
             pbar.update(len(chunk))
 
-
-def gpg_import_key(key_id):
+def gpg_import_key(key_id: str) -> bool:
     print(f"[!] Importing GPG key {key_id} from keys.openpgp.org")
-    subprocess.run(
+
+    result = subprocess.run(
         [
             "gpg",
             "--keyserver",
@@ -65,9 +76,24 @@ def gpg_import_key(key_id):
             "--recv-keys",
             key_id,
         ],
-        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
+    if result.returncode != 0:
+        print(Fore.RED + "[X] Failed to import GPG key")
+        print(result.stderr)
+        return False
+
+    # Show fingerprint for transparency
+    subprocess.run(
+        ["gpg", "--fingerprint", key_id],
+        check=False
+    )
+
+    print(Fore.GREEN + f"[+] GPG key {key_id} imported")
+    return True
 
 def gpg_verify(archive_path, asc_path):
     result = subprocess.run(
@@ -78,22 +104,36 @@ def gpg_verify(archive_path, asc_path):
     )
 
     if result.returncode == 0:
-        print("[+] GPG signature verified")
+        print(Fore.GREEN + "[+] GPG signature verified")
+
+        if "WARNING" in result.stderr or "expired" in result.stderr.lower():
+            print(Fore.YELLOW + "[!] GPG reported warnings:")
+            print(result.stderr.strip())
+
         return True
 
     if "No public key" in result.stderr:
         key_id = extract_key_id(result.stderr)
-
-        print("\n[!] Missing GPG public key")
-        print(f"[!] Key ID: {key_id}")
-        print("[!] This key belongs to a Python Release Manager")
-
+        if not key_id:
+            print(Fore.RED + "[X] Unable to determine signing key")
+            return False
+        
+        print("[!] Trust decision required:")
+        print("[!]  - Import key and verify authenticity (recommended)")
+        print("[!]  - Abort installation")
+        print("[!]  - Proceed WITHOUT verification (unsafe)")
         choice = input("Import this key? [y/N]: ").strip().lower()
+
         if choice != "y":
             print("[X] User declined key import")
             return False
 
-        gpg_import_key(key_id)
+        if not gpg_import_key(key_id):
+            choice_2 = input("Do you want to continue without importing/verifying the key? [y/N]: ").strip().lower()
+            if choice_2 == "y":
+                print(Fore.YELLOW + "[!] Skipping GPG verification as per user request")
+                return True
+            return False
 
         retry = subprocess.run(
             ["gpg", "--verify", asc_path, archive_path],
@@ -141,7 +181,7 @@ def confirm_eol_version(version, skip=False):
     choice = input("Do you want to continue? [y/N]: ").strip().lower()
     return choice == "y", True
 
-def install(version, reinstall=False, enable_tkinter=True):
+def install(version, reinstall=False, enable_tkinter=True, ensure_pip=True):
     eol = confirm_eol_version(version, skip=reinstall)
     if not eol[0]:
         print(Fore.RED + "[*] Aborted by user.")
@@ -163,13 +203,23 @@ def install(version, reinstall=False, enable_tkinter=True):
         print(f"[+] Downloading Python {version}")
         download_file(f"{base_url}/{archive}", archive_path)
         download_file(f"{base_url}/{signature}", sig_path)
+        if not sig_path.exists():
+            print(Fore.YELLOW + "[!] No GPG signature file found")
+            choice = input("Continue without GPG verification? [y/N]: ").strip().lower()
+            if choice != "y":
+                print(Fore.RED + "[X] Aborting: source is not trusted")
+                return
+        else:
+            if not gpg_verify(archive_path, sig_path):
+                print(Fore.RED + "[X] Aborting: source is not trusted")
+                return
 
         if not eol[1] and not gpg_verify(archive_path, sig_path):
             print(Fore.RED + "[X] Aborting: source is not trusted")
             return
         
         if eol[1]:
-            print(Fore.YELLOW + "[*] Skipping GPG Signature check, No  GPG signatures found!")
+            print(Fore.YELLOW + "[!] WARNING: Python is EOL, but GPG verification is still enforced")
 
         extract_source(archive_path, src_dir)
         source_tree = src_dir / f"Python-{version}"
@@ -182,7 +232,7 @@ def install(version, reinstall=False, enable_tkinter=True):
             version=version,
         )
 
-        installer.configure()
+        installer.configure(ensure_pip=ensure_pip)
         installer.compile()
         installer.staged_install(enable_tk=enable_tkinter)
         installer.verify_staging()
@@ -383,7 +433,7 @@ def remove_version(version, no_confirm=False):
     except Exception as e:
         print(f"[X] Failed to remove Python {version}: {e}")
 
-def reinstall_version(version, no_check=False, enable_tkinter=True):
+def reinstall_version(version, no_check=False, enable_tkinter=True, ensure_pip=True):
     prefix = INSTALL_ROOT / f"python-{version}"
 
     if not no_check and not prefix.exists():
@@ -409,10 +459,10 @@ def reinstall_version(version, no_check=False, enable_tkinter=True):
         print(Fore.YELLOW + f"[!] Python {version} not found — proceeding with fresh install")
 
     # Proceed with fresh install
-    install(version, reinstall=True, enable_tkinter=enable_tkinter)
+    install(version, reinstall=True, enable_tkinter=enable_tkinter, ensure_pip=ensure_pip)
 
 def is_pyinstaller_internal_flag(arg):
-    return arg.startswith("-") and arg not in ("--yes", "--no-tk")
+    return arg.startswith("-") and arg not in ("--yes", "--no-tk", "--without-ensurepip")
 
 def print_help():
     print(f"""
@@ -447,6 +497,10 @@ FLAGS:
     --no-tk
     :    Disable Tkinter support (passed to installer).
     :    May cause some tests to fail, but can resolve certain build issues.
+    --without-ensurepip
+    :    Do not install pip with Python.
+    :    Not recommended, as it will require manual pip installation later.
+    :    This may fix build issues on very old versions, but should be avoided for modern Python releases after 3.5.
 EXAMPLES:
   sevpy install 3.12.2
   sevpy list
@@ -501,11 +555,12 @@ def main():
             return
         version = args[1]
         enable_tkinter = not ("--no-tk" in args) # checking if --no-tk is provided as argument to prevent tkinter installation
+        ensure_pip = not ("--without-ensurepip" in args) # checking if --without-ensurepip is provided as argument to prevent pip installation
         for _version, info in find_installed_versions().items():
             if version == _version:
                 print(Fore.GREEN + f"[+] Version Python-{version} already exists at {info['prefix']}")
                 return
-        install(version, enable_tkinter=enable_tkinter)
+        install(version, enable_tkinter=enable_tkinter, ensure_pip=ensure_pip)
 
     elif cmd == "list":
         installed = find_installed_versions()
@@ -545,7 +600,8 @@ def main():
         version = args[1]
         no_confirm = "--yes" in args
         enable_tkinter = not ("--no-tk" in args)
-        reinstall_version(version, no_check=no_confirm, enable_tkinter=enable_tkinter)
+        ensure_pip = not ("--without-ensurepip" in args)
+        reinstall_version(version, no_check=no_confirm, enable_tkinter=enable_tkinter, ensure_pip=ensure_pip)
     elif cmd == "clean":
         clean()
     else:
